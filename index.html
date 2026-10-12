@@ -469,16 +469,39 @@ function expHint(cat){
     'Property Maintenance':'If the property is let, take these costs off the rent when you record the rental income instead, so they are not counted twice.'}[cat]
     ||'Only expenses that relate directly to the trust\'s income count. If unsure, choose capital and ask your accountant.';
 }
-// Income received by one trust in one tax year (sale proceeds are capital, excluded)
+// ---- Income tax, checked line by line against the legislation (October 2026) ----
+// Trust Manager calculates income tax from 2024-25, when the £500 rule began (Option A).
+// Earlier years are covered by the trust's own returns; the tax pool and any unused expenses
+// at 5 April 2024 are entered in the trust settings.
+var TAX_FROM=2024;
+function beforeTaxFrom(ty){return ty<TAX_FROM;}
+// Rates by tax year. ITA 2007 ss.6-9; FA 2026 s.4 (dividend ordinary rate 10.75% from 2026-27);
+// FA 2026 ss.5-7 and Sch 1 (from 2027-28: savings and property basic rate 22%, and the savings
+// and property trust rates of 47% for discretionary trustees).
+function taxRates(ty){
+  var sp=ty>=2027;
+  return{trustOther:TRUST_RATE,trustSav:sp?0.47:TRUST_RATE,trustProp:sp?0.47:TRUST_RATE,trustDiv:DIV_TRUST_RATE,
+    basicOther:BASIC_RATE,basicSav:sp?0.22:BASIC_RATE,basicProp:sp?0.22:BASIC_RATE,divOrd:divOrdinaryRate(ty)};
+}
+// What the trust had at 5 April 2024 (only for trusts set up before 6 April 2024)
+function openingFigures(trust){
+  var old=!trust.established||trust.established<(TAX_FROM+'-04-06');
+  return{needed:old,pool:old?(Number(trust.openingPool)||0):0,tme:old?(Number(trust.openingTME)||0):0,
+    poolEntered:!old||(trust.openingPool!==undefined&&trust.openingPool!==null&&trust.openingPool!=='')};
+}
+// Income received by one trust in one tax year. Sale proceeds are capital. Income an interest in
+// possession trust has mandated straight to the beneficiary is not the trustees' (SA950 Step 1(3)).
 function trustYearIncome(trust,ty){
-  var r={total:0,div:0,sav:0,oth:0,other:0};
+  var r={total:0,div:0,sav:0,prop:0,oth:0,other:0,mandated:0},iip=isIIPType(trust.type||'');
   S.income.forEach(function(i){
     if(i.trustId!==trust.id||i.type==='Sale Proceeds')return;
     if(taxYearOf(i.date)!==ty)return;
-    var a=Number(i.amount)||0;r.total+=a;
-    if(i.type==='Dividends')r.div+=a;else if(i.type==='Interest')r.sav+=a;else r.oth+=a;
+    var a=Number(i.amount)||0;
+    if(i.mandated&&iip){r.mandated+=a;return;}
+    r.total+=a;
+    if(i.type==='Dividends')r.div+=a;else if(i.type==='Interest')r.sav+=a;else if(i.type==='Rental Income')r.prop+=a;else r.oth+=a;
   });
-  r.other=r.sav+r.oth;
+  r.other=r.sav+r.prop+r.oth;
   return r;
 }
 function tmeIncurred(trust,ty){
@@ -486,54 +509,59 @@ function tmeIncurred(trust,ty){
   return t;
 }
 // One tax year of trustees' income tax.
-// Discretionary: expenses paid from income are grossed up and set against dividends, then
-// savings, then other income (s.486, TSEM8250); that income is taxed at the dividend ordinary /
-// basic rate instead of the trust rates (s.484, TSEM8215). Only trust-rate tax enters the pool
-// (s.498, TSEM3021). Unused expenses carry forward (TSEM8240). The de minimis test uses income
-// before expenses (s.24B, TSEM3011).
+// - £500 rule (s.24B): the test uses income before expenses; the reduced amount applies to a
+//   discretionary trust with any trust rate income, which s.24B(5)(b) measures ignoring expenses.
+// - In a £500 year net income is nil, so there is no trust rate income for expenses to be set
+//   against: all of the year's expenses carry forward (s.485).
+// - Otherwise expenses paid from income are grossed up and set against dividends, then savings,
+//   then property (from 2027-28), then other income (s.486); that slice is taxed at the lower
+//   rates instead of the trust rates (s.484(4)). Only trust-rate tax enters the pool (s.497).
 function computeTaxYear(trust,ty,carryIn){
-  var inc=trustYearIncome(trust,ty),tType=trust.type||'Discretionary';
-  var r={taxYear:ty,income:inc.total,divIncome:inc.div,otherIncome:inc.other,limit:DE_MINIMIS,underDeMinimis:inc.total<=DE_MINIMIS,
-    otherRate:0,divRate:0,otherTax:0,divTax:0,tax:0,poolTax:0,highTax:0,lowTax:0,taxWithoutTme:0,applies:true,
+  var inc=trustYearIncome(trust,ty),tType=trust.type||'Discretionary',RT=taxRates(ty);
+  var r={taxYear:ty,income:inc.total,divIncome:inc.div,otherIncome:inc.other,mandated:inc.mandated,limit:DE_MINIMIS,underDeMinimis:inc.total<=DE_MINIMIS,
+    otherRate:0,divRate:0,otherTax:0,divTax:0,tax:0,poolTax:0,highTax:0,lowTax:0,taxWithoutTme:0,applies:true,beforeRules:false,rates:RT,
     tmeIncurred:0,tmeCarriedIn:carryIn||0,tmeUsed:0,tmeCarriedOut:carryIn||0,tmeGrossed:0,trustRateIncome:0};
   if(tType==='Bare'||tType==='Charitable'){r.applies=false;return r;}
+  if(beforeTaxFrom(ty)){r.beforeRules=true;r.underDeMinimis=false;r.tmeCarriedIn=0;r.tmeCarriedOut=0;return r;}
   if(isIIPType(tType)){
-    r.otherRate=BASIC_RATE;r.divRate=divOrdinaryRate(ty);r.tmeCarriedOut=0;
+    r.otherRate=RT.basicOther;r.divRate=RT.divOrd;r.tmeCarriedOut=0;
     if(r.underDeMinimis)return r;
-    r.otherTax=inc.other*r.otherRate;r.divTax=inc.div*r.divRate;r.tax=r.otherTax+r.divTax;r.lowTax=r.tax;r.taxWithoutTme=r.tax;
+    r.otherTax=inc.sav*RT.basicSav+inc.prop*RT.basicProp+inc.oth*RT.basicOther;r.divTax=inc.div*RT.divOrd;
+    r.tax=r.otherTax+r.divTax;r.lowTax=r.tax;r.taxWithoutTme=r.tax;
     return r;
   }
-  r.otherRate=TRUST_RATE;r.divRate=DIV_TRUST_RATE;
+  r.otherRate=RT.trustOther;r.divRate=RT.trustDiv;
   r.tmeIncurred=tmeIncurred(trust,ty);
+  r.limit=deMinimisLimit(trust,inc.total>0.005);
+  r.underDeMinimis=inc.total<=r.limit;
+  if(r.underDeMinimis){r.tmeCarriedOut=r.tmeIncurred+r.tmeCarriedIn;return r;}
   var left=r.tmeIncurred+r.tmeCarriedIn;
-  var buckets=[{amt:inc.div,low:divOrdinaryRate(ty),high:DIV_TRUST_RATE,div:true},{amt:inc.sav,low:BASIC_RATE,high:TRUST_RATE},{amt:inc.oth,low:BASIC_RATE,high:TRUST_RATE}];
-  buckets.forEach(function(b){
-    var cap=b.amt*(1-b.low),use=Math.min(left,cap);
-    b.g=use>=cap-1e-9?b.amt:use/(1-b.low);
-    left-=use;r.tmeGrossed+=b.g;
+  var buckets=[{amt:inc.div,low:RT.divOrd,high:RT.trustDiv,div:true},{amt:inc.sav,low:RT.basicSav,high:RT.trustSav},{amt:inc.prop,low:RT.basicProp,high:RT.trustProp},{amt:inc.oth,low:RT.basicOther,high:RT.trustOther}];
+  buckets.forEach(function(bk){
+    var cap=bk.amt*(1-bk.low),use=Math.min(left,cap);
+    bk.g=use>=cap-1e-9?bk.amt:use/(1-bk.low);
+    left-=use;r.tmeGrossed+=bk.g;
   });
   r.tmeUsed=r.tmeIncurred+r.tmeCarriedIn-left;r.tmeCarriedOut=left;
   r.trustRateIncome=Math.max(0,inc.total-r.tmeGrossed);
-  r.limit=deMinimisLimit(trust,r.trustRateIncome>0.005);
-  r.underDeMinimis=inc.total<=r.limit;
-  if(r.underDeMinimis)return r;
-  buckets.forEach(function(b){
-    var lo=b.g*b.low,hi=(b.amt-b.g)*b.high;
+  buckets.forEach(function(bk){
+    var lo=bk.g*bk.low,hi=(bk.amt-bk.g)*bk.high;
     r.lowTax+=lo;r.highTax+=hi;
-    if(b.div)r.divTax+=lo+hi;else r.otherTax+=lo+hi;
+    if(bk.div)r.divTax+=lo+hi;else r.otherTax+=lo+hi;
   });
   r.tax=r.lowTax+r.highTax;
   r.poolTax=trust.settlorInterested?0:r.highTax;
-  r.taxWithoutTme=inc.div*DIV_TRUST_RATE+inc.other*TRUST_RATE;
+  r.taxWithoutTme=buckets.reduce(function(t2,bk){return t2+bk.amt*bk.high;},0);
   return r;
 }
-// All tax years in order, carrying unused expenses forward
+// All tax years in order, carrying unused expenses forward from 5 April 2024
 function trustTaxYears(trust){
   var years={};
   S.income.forEach(function(i){if(i.trustId===trust.id&&i.type!=='Sale Proceeds'&&i.date)years[taxYearOf(i.date)]=true;});
   S.expenses.forEach(function(e){if(e.trustId===trust.id&&e.date&&expenseFunding(e)==='income')years[taxYearOf(e.date)]=true;});
-  var out={},carry=0;
-  Object.keys(years).map(Number).sort(function(a,b){return a-b}).forEach(function(ty){
+  var out={},carry=openingFigures(trust).tme;
+  Object.keys(years).map(Number).sort(function(a2,b2){return a2-b2}).forEach(function(ty){
+    if(beforeTaxFrom(ty)){out[ty]=computeTaxYear(trust,ty,0);return;}
     var y=computeTaxYear(trust,ty,carry);out[ty]=y;carry=y.tmeCarriedOut;
   });
   return out;
@@ -541,10 +569,9 @@ function trustTaxYears(trust){
 function trustIncomeTax(trust,ty){
   var all=trustTaxYears(trust);
   if(all[ty])return all[ty];
-  var carry=0;Object.keys(all).map(Number).sort(function(a,b){return a-b}).forEach(function(y){if(y<ty)carry=all[y].tmeCarriedOut;});
+  var carry=openingFigures(trust).tme;Object.keys(all).map(Number).sort(function(a2,b2){return a2-b2}).forEach(function(y){if(y<ty&&!beforeTaxFrom(y))carry=all[y].tmeCarriedOut;});
   return computeTaxYear(trust,ty,carry);
 }
-
 // ============================================================
 // TAX POOL (ITA 2007 ss.496-498)
 // In: tax charged at the trust rates only (nil in de minimis years; not the tax on income
@@ -557,18 +584,18 @@ function calcTaxPool(trust){
   var tType=trust.type||'Discretionary';
   if(tType==='Bare'||isIIPType(tType)||tType==='Charitable')return null;
   if(trust.settlorInterested)return null;
-  var all=trustTaxYears(trust),poolIn=0;
+  var all=trustTaxYears(trust),opening=openingFigures(trust).pool,poolIn=opening;
   Object.keys(all).forEach(function(y){poolIn+=all[y].poolTax;});
   var credits=distTaxById(trust);
   var curYear=taxYearOf(tdy());
   var poolOut=0,tyOut=0;
   S.distributions.forEach(function(d){
-    if(d.trustId!==trust.id)return;
+    if(d.trustId!==trust.id||!d.date||beforeTaxFrom(taxYearOf(d.date)))return;   // covered by the 5 April 2024 figure
     var c=(credits[d.id]&&credits[d.id].taxCredit)||0;
     poolOut+=c;if(taxYearOf(d.date)===curYear)tyOut+=c;
   });
   var tyIn=trustIncomeTax(trust,curYear).poolTax;
-  return{poolIn:poolIn,poolOut:poolOut,balance:poolIn-poolOut,
+  return{poolIn:poolIn,opening:opening,poolOut:poolOut,balance:poolIn-poolOut,
     thisYear:{poolIn:tyIn,poolOut:tyOut,balance:tyIn-tyOut},curYear:curYear};
 }
 
@@ -935,7 +962,7 @@ function complianceDates(t,today){
       else add(nd,nl+', by '+fdU(nd),'tax');
     }
     if(rs.taxable&&rs.notice==='unsure')kd.push({date:null,label:'Does HMRC send this trust a tax return each year? Answer in the trust settings: if not, you must tell HMRC about the tax to pay',du:null,type:'tax'});
-    if(!rs.taxable&&rs.notice!=='yes')kd.push({date:null,label:'No tax return needed for '+shortYear(ry)+': '+(rs.income>0?'income was within the '+fm(rs.limit)+' tax-free amount':'no income')+' and no taxable gains. If HMRC sends a notice to file, you must still file',du:null,type:'tax'});
+    if(!rs.taxable&&rs.notice!=='yes')kd.push({date:null,label:'No tax return needed for '+shortYear(ry)+': '+(rs.income>0?'income was within the '+fm(rs.limit)+' tax-free amount':'no income')+' and no taxable gains. If HMRC sends a notice to file, you must still file'+(t.settlorInterested?'. The settlor must still include the trust\'s income on their own tax return':''),du:null,type:'tax'});
     var prev=trustIncomeTax(t,cur-1);
     if(prev&&prev.tax>1000){
       add((cur+1)+'-01-31','1st payment on account for '+shortYear(cur)+' (an advance towards that year\'s tax), if HMRC asks for one','tax');
@@ -973,6 +1000,10 @@ function complianceDates(t,today){
   cgtPropertyDeadlines(t).forEach(function(p){add(p.date,'CGT on UK property: report and pay if due ('+(p.gain.asset||'property')+')','tax');});
   // R185: good practice, not a deadline
   var paidLastYear=S.distributions.some(function(d){return d.trustId===t.id&&(d.distType||'').indexOf('Income')===0&&d.date&&taxYearOf(d.date)===cur-1;});
+  // R185 (Settlor): the settlor is taxed on the income (ITTOIA 2005 ss.624, 629) and needs the figures
+  var lastY=cur-1,siInc=t.settlorInterested&&trustIncomeTax(t,lastY).income>0;
+  var childPaid=!t.settlorInterested&&S.distributions.some(function(d){var b=S.beneficiaries.find(function(x){return x.id===d.beneficiaryId});return d.trustId===t.id&&(d.distType||'').indexOf('Income')===0&&d.date&&taxYearOf(d.date)===lastY&&b&&settlorMinorChildOn(b,d.date);});
+  if(siInc||childPaid)kd.push({date:null,label:'R185 (Settlor): give the settlor a statement of '+(siInc?'the trust\'s '+shortYear(lastY)+' income':'the income paid to their child in '+shortYear(lastY))+' and the tax the trustees paid, for their own tax return',du:null,type:'admin'});
   if(paidLastYear)kd.push({date:null,label:'R185: give one to each beneficiary paid income in '+shortYear(cur-1)+' (they need it for their tax return; required if they ask in writing)',du:null,type:'admin'});
   return kd;
 }
@@ -998,7 +1029,7 @@ function kdGuide(label){if(/SA900|payment on account/.test(label))return['sa900'
 function bandLabel(b){return{basic:'Basic rate',higher:'Higher rate',additional:'Additional rate','non-taxpayer':'Non-taxpayer'}[b]||b||'Not known';}
 function bandOpts(sel,withUnknown){var o=withUnknown?[['','Not known']]:[];['basic','higher','additional','non-taxpayer'].forEach(function(v){o.push([v,bandLabel(v)]);});return o.map(function(x){return'<option value="'+x[0]+'"'+(x[0]===sel?' selected':'')+'>'+x[1]+'</option>'}).join('');}
 function incLabel(v){return{'Rental Income':'Rent','Sale Proceeds':'Sale proceeds (capital, not income)','Insurance':'Insurance payout'}[v]||v;}
-function incHint(v){return{'Interest':'Bank or building society interest: the amount paid into the account (banks pay it without taking tax off).','Dividends':'Dividends from shares or funds: the amount actually received.','Rental Income':'Rent received, less the costs of letting the property (repairs, agent\'s fees, insurance on the let property). Don\'t record those costs again as expenses.','Sale Proceeds':'Money from selling an investment or property. This is capital, not income, so it is not taxed as income here. If there was a gain, record it in the Tax Centre (Gain/Loss).','Insurance':'Only record this as income if it replaces lost income, such as a rent guarantee. A payout for damage to an asset is capital: ask your accountant.','Other':'Anything else the trust receives. If you are not sure whether it is income or capital, ask your accountant.'}[v]||'';}
+function incHint(v){return{'Interest':'Bank or building society interest: the amount paid into the account (banks pay it without taking tax off).','Dividends':'Dividends from shares or funds: the amount actually received. Interest distributions from bond or cash funds count as interest: record them under Interest.','Rental Income':'Rent less the costs of letting the property (repairs, agent\'s fees, insurance on the let property). Use the date the rent is for, not when it arrived: for example, March\'s rent paid on 7 April goes in March. Don\'t take off mortgage or loan interest: tell your accountant about it instead. Don\'t record letting costs again as expenses.','Sale Proceeds':'Money from selling an investment or property. This is capital, not income, so it is not taxed as income here. If there was a gain, record it in the Tax Centre (Gain/Loss).','Insurance':'Only record this as income if it replaces lost income, such as a rent guarantee. A payout for damage to an asset is capital: ask your accountant.','Other':'Anything else the trust receives. If you are not sure whether it is income or capital, ask your accountant.'}[v]||'';}
 function distLabel(v){return{'Income - Non-Savings':'Income: rent or other income','Income - Savings':'Income: interest','Income - Dividends':'Income: dividends','Capital':'Capital (the trust fund itself)'}[v]||v;}
 function distTypeHint(t){var tt=(t&&t.type)||'Discretionary';
   if(tt==='Bare')return'In a bare trust the money already belongs to the beneficiary. Choose what it came from, for your records.';
@@ -1006,7 +1037,7 @@ function distTypeHint(t){var tt=(t&&t.type)||'Discretionary';
   if(isIIPType(tt))return'Choose what the payment came from. It decides which box it goes in on the R185: rent and other income Box 3, interest Box 4, dividends Box 5. Capital is money from the trust fund itself.';
   return'Income means the trust\'s rent, interest or dividends. For this trust all three income choices give the same result (a 45% tax credit), so pick the closest. Capital means money from the trust fund itself, which can lead to an inheritance tax exit charge.';}
 function trustRecordYears(t){var ys={};ys[taxYearOf(tdy())]=true;if(t){['income','expenses','distributions','gains'].forEach(function(k){S[k].forEach(function(x){if(x.trustId===t.id&&x.date)ys[taxYearOf(x.date)]=true;});});}return Object.keys(ys).map(Number).sort(function(a,b){return b-a});}
-function r185Years(benId){var ys={};S.distributions.forEach(function(d){if(d.trustId===AT&&d.beneficiaryId===benId&&(d.distType||'').indexOf('Income')===0&&d.date){var y=taxYearOf(d.date);ys[y]=(ys[y]||0)+(Number(d.amount)||0);}});return Object.keys(ys).map(Number).sort(function(a,b){return b-a}).map(function(y){return{y:y,total:ys[y]};});}
+function r185Years(benId){var ys={};S.distributions.forEach(function(d){if(d.trustId===AT&&d.beneficiaryId===benId&&(d.distType||'').indexOf('Income')===0&&d.date&&!beforeTaxFrom(taxYearOf(d.date))){var y=taxYearOf(d.date);ys[y]=(ys[y]||0)+(Number(d.amount)||0);}});return Object.keys(ys).map(Number).sort(function(a,b){return b-a}).map(function(y){return{y:y,total:ys[y]};});}
 function distPreviewHTML(t,o,editId){
   if(!t)return'';
   var amt=Number(o.amount)||0,type=o.distType||'Income - Non-Savings',h='';
@@ -1421,7 +1452,7 @@ window.saveTrust=function(){
   var o=Object.assign({},prev||{},{id:MD.id||gid(),name:n,type:val("m-type","Discretionary"),established:val("m-est",""),
     initialValue:Number(val("m-val",0)||0),currentValue:Number(val("m-curval",0)||0),settlorPriorCLTs:Number(val("m-clts",0)||0),
     settlorTrusts:Number(val("m-strust",1)||1),settlorInterested:chk("m-settint"),utr:val("m-utr",""),agentRef:val("m-agentref",""),
-    notes:val("m-notes",""),rpStatus:val("m-rp","auto"),sameDayTrusts:chk("m-sameday"),addedProperty:chk("m-added"),businessFarmAssets:chk("m-bizfarm"),otherDiscTrusts:val("m-otherdisc",""),hmrcNotice:val("m-notice","unsure"),trsRegistered:(function(v){return v==='yes'?true:v==='no'?false:null;})(val("m-trsreg","unsure")),trsLastUpdated:val("m-trsdate","")});
+    notes:val("m-notes",""),rpStatus:val("m-rp","auto"),sameDayTrusts:chk("m-sameday"),addedProperty:chk("m-added"),businessFarmAssets:chk("m-bizfarm"),otherDiscTrusts:val("m-otherdisc",""),openingPool:val("m-pool0",""),openingTME:val("m-tme0",""),hmrcNotice:val("m-notice","unsure"),trsRegistered:(function(v){return v==='yes'?true:v==='no'?false:null;})(val("m-trsreg","unsure")),trsLastUpdated:val("m-trsdate","")});
   var moreEl=document.getElementById('m-more');o.detailsSeen=!!((prev&&prev.detailsSeen)||(moreEl&&moreEl.open));
   var errsT=validateRecord('trust',Object.assign({},o,{settlorTrusts:val("m-strust","1"),otherDiscTrusts:val("m-otherdisc","")}),null);
   if(errsT.length){formErrors(errsT);return;}
@@ -1497,6 +1528,7 @@ window.saveDec=function(){
 window.saveInc=function(){
   var amt=document.getElementById("m-amt").value;
   var o={id:MD.id||gid(),trustId:MD.trustId||AT,amount:amt===''?'':Number(amt),date:document.getElementById("m-date").value||tdy(),source:document.getElementById("m-src").value,type:document.getElementById("m-type").value};
+  var mEl=document.getElementById("m-mandated");if(mEl&&mEl.checked)o.mandated=true;
   var errs=validateRecord('income',o,trustOf(o.trustId));if(errs.length){formErrors(errs);return;}
   if(MD.id){S.income=S.income.map(function(v){return v.id===MD.id?o:v})}else{S.income.push(o)}sv(o.trustId);cm();
 };
@@ -1755,6 +1787,8 @@ function R(){
     h+='</div>';
     var stT=gs(),todo=stT.kd.filter(function(d){return d.overdue||d.du===null||d.du>=0;}).slice(0,4);
     var vs=valueStaleDays(t);if(vs!==null&&vs>180)todo.unshift({label:'Check the trust\'s value: you last updated it '+Math.round(vs/30)+' months ago',du:null,finish:true});
+    var ofH=openingFigures(t);
+    if(calcTaxPool(t)&&!ofH.poolEntered){var odIx=todo.filter(function(x){return x.overdue||(x.du!==null&&x.du<0);}).length;todo.splice(odIx,0,{label:'Enter the trust\'s tax pool at 5 April 2024, from its last tax return, so the tax figures start from the right place',du:null,finish:true});}
     if(!t.detailsSeen)todo.unshift({label:'Finish the trust\'s details (the settlor and inheritance tax questions) so the tax figures are accurate',du:null,finish:true});
     h+='<div class="kl" style="margin:22px 0 10px">WHAT NEEDS DOING</div>';
     if(!todo.length)h+='<div class="card" style="font-size:13px;color:#64748b">Nothing to do right now.</div>';
@@ -1831,21 +1865,24 @@ function R(){
     // 1. Income tax
     var ity=trustIncomeTax(t,selTY),isIIPt=isIIPType(t.type||'');
     h+='<div class="tc-card"><div class="tc-k">Income tax</div>';
-    if(!ity.applies){
+    if(ity.applies&&ity.beforeRules){
+      h+='<div class="tc-a">Not calculated for '+YL+'</div><div class="tc-w">Trust Manager works out income tax from '+shortYear(TAX_FROM)+', when the current rules began. For '+YL+', use the trust\'s tax return for that year. Choose a later year above.</div>';
+    } else if(!ity.applies){
       h+='<div class="tc-a">'+(t.type==='Bare'?'No income tax for the trust: the beneficiary pays it on their own return':'Charitable trusts are generally exempt from income tax')+'</div>';
     } else {
       var saved=ity.taxWithoutTme-ity.tax;
       if(ity.underDeMinimis)h+='<div class="tc-a">'+(ity.income>0?'No income tax for '+YL+': income of '+fm(ity.income)+' is within the '+term('taxfree','tax-free amount')+' of '+fm(ity.limit):'No income recorded for '+YL+', so no income tax')+'</div>'
         +(ity.income>0?'<div class="tc-w">If income goes over '+fm(ity.limit)+', tax is due on all of it, not just the amount over.</div>':'');
       else h+='<div class="tc-a">The trust owes about '+fm(ity.tax)+' in income tax for '+YL+'</div>'
-        +'<div class="tc-w">Pay by 31 Jan '+(selTY+2)+'. '+(isIIPt?'Trusts like this pay 20% on income and a lower rate on dividends; the person entitled to the income claims credit for it.':'Income of '+fm(ity.income)+' was over the '+fm(ity.limit)+' '+term('taxfree','tax-free amount')+', so all of it is taxed.')+(saved>0.005?' The '+term('tme','expenses you paid from income')+' cut the bill by '+fm(saved)+'.':'')+(t.settlorInterested?' The tax is treated as paid on the settlor\'s behalf.':'')+'</div>';
+        +'<div class="tc-w">Pay by 31 Jan '+(selTY+2)+'. '+(isIIPt?'Trusts like this pay '+(selTY>=2027?'22% on interest and rent and 20% on other income':'20% on income')+', and '+pct(ity.rates.divOrd)+' on dividends; the person entitled to the income claims credit for it.':'Income of '+fm(ity.income)+' was over the '+fm(ity.limit)+' '+term('taxfree','tax-free amount')+', so all of it is taxed.')+(saved>0.005?' The '+term('tme','expenses you paid from income')+' cut the bill by '+fm(saved)+'.':'')+(t.settlorInterested?' The tax is treated as paid on the settlor\'s behalf.':'')+'</div>';
+      if(ity.mandated>0)h+='<div class="tc-w">'+fm(ity.mandated)+' paid straight to the beneficiary isn\'t included: it isn\'t the trustees\' income.</div>';
       var irows=[["Trust income for the year (not counting sale proceeds)",fm(ity.income)],["Tax-free amount (de minimis)",fm(ity.limit)+(ity.limit<DE_MINIMIS?' (shared with the settlor\'s other discretionary trusts)':'')]];
       if(ity.tmeIncurred>0||ity.tmeCarriedIn>0){irows.push(["Expenses paid from income this year",fm(ity.tmeIncurred)]);if(ity.tmeCarriedIn>0)irows.push(["Unused expenses brought forward",fm(ity.tmeCarriedIn)]);}
       if(ity.underDeMinimis){irows.push(["Estimated income tax",fm(0)+" (within de minimis)"]);}
-      else if(isIIPt){irows.push(["Non-dividend income @ "+pct(ity.otherRate),fm(ity.otherTax)]);irows.push(["Dividends @ "+pct(ity.divRate),fm(ity.divTax)]);irows.push(["Estimated income tax",fm(ity.tax)]);}
+      else if(isIIPt){irows.push(["Non-dividend income @ "+(selTY>=2027?"22% (interest, rent) / 20% (other)":pct(ity.otherRate)),fm(ity.otherTax)]);irows.push(["Dividends @ "+pct(ity.divRate),fm(ity.divTax)]);irows.push(["Estimated income tax",fm(ity.tax)]);}
       else{
         if(ity.tmeGrossed>0)irows.push(["Income covered by expenses ("+fm(ity.tmeGrossed)+"), taxed at lower rates",fm(ity.lowTax)]);
-        irows.push(["Income taxed at trust rates (45% / 39.35%)",fm(ity.highTax)]);
+        irows.push(["Income taxed at trust rates ("+(selTY>=2027?"47% interest and rent, 45% other, 39.35% dividends":"45% / 39.35%")+")",fm(ity.highTax)]);
         irows.push(["Estimated income tax",fm(ity.tax)]);
         if(saved>0.005)irows.push(["Tax saved by expenses paid from income",fm(saved)]);
       }
@@ -1963,7 +2000,7 @@ function R(){
     h+='<div><div class="kl">Expenses paid</div><div style="font-size:18px;font-weight:700;color:#d97706">'+fm(st2?st2.tE:0)+'</div></div>';
     h+='<div><div class="kl">Paid to beneficiaries</div><div style="font-size:18px;font-weight:700;color:#dc2626">'+fm(st2?st2.tD:0)+'</div></div>';
     h+='</div><div class="hint" style="text-align:center;margin-top:10px">Totals of everything recorded so far (sale proceeds are capital and not included). For one tax year, use Annual Account. Tap any entry below to change or delete it.</div></div>';
-    var ax=[].concat(gin().map(function(i){return{id:i.id,kind:'income',date:i.date,txType:i.type==="Sale Proceeds"?"capital receipt":"income",amount:i.amount,label:i.source||i.type}})).concat(gex().map(function(e){return{id:e.id,kind:'expense',date:e.date,txType:"expense",amount:e.amount,label:e.description||e.category}})).concat(gdi().map(function(d){return{id:d.id,kind:'distribution',date:d.date,txType:"distribution",amount:d.amount,label:"Distribution to "+bna(d.beneficiaryId)}})).sort(function(a,b){return new Date(b.date)-new Date(a.date)});
+    var ax=[].concat(gin().map(function(i){return{id:i.id,kind:'income',date:i.date,txType:i.type==="Sale Proceeds"?"capital receipt":"income",amount:i.amount,label:(i.source||i.type)+(i.mandated?' (paid straight to the beneficiary)':'')}})).concat(gex().map(function(e){return{id:e.id,kind:'expense',date:e.date,txType:"expense",amount:e.amount,label:e.description||e.category}})).concat(gdi().map(function(d){return{id:d.id,kind:'distribution',date:d.date,txType:"distribution",amount:d.amount,label:"Distribution to "+bna(d.beneficiaryId)}})).sort(function(a,b){return new Date(b.date)-new Date(a.date)});
     h+='<div class="card"><div class="kl" style="margin-bottom:12px">ALL TRANSACTIONS</div>';
     if(ax.length===0)h+='<div style="padding:20px;text-align:center;color:#64748b;font-size:13px">No transactions</div>';
     else ax.forEach(function(tx){h+='<div role="button" tabindex="0" onclick="om(\''+tx.kind+'\',\''+ja(tx.id)+'\')" style="cursor:pointer;padding:12px 0;border-bottom:1px solid #e5e1dc;display:flex;justify-content:space-between;align-items:center"><div><div style="font-size:13px;font-weight:600">'+esc(tx.label)+'</div><div style="font-size:11px;color:#64748b;margin-top:2px">'+fd(tx.date)+' \u00B7 '+tx.txType+'</div></div><div style="font-weight:700;color:'+(tx.txType==="income"||tx.txType==="capital receipt"?"#059669":"#dc2626")+'">'+(tx.txType==="income"||tx.txType==="capital receipt"?"+":"\u2212")+fm(tx.amount)+'</div></div>'});
@@ -2114,10 +2151,12 @@ function modalBody(){
     h+='<div class="g2"><div class="fg"><label class="label" for="m-trsreg">Is the trust registered on the Trust Registration Service (TRS)?</label><select class="sel" id="m-trsreg">'+[['yes','Yes'],['no','No, not yet'],['unsure','Not sure']].map(function(o){return'<option value="'+o[0]+'"'+(trsSel===o[0]?' selected':'')+'>'+o[1]+'</option>'}).join('')+'</select><div class="hint">Most trusts must be on HMRC\'s '+term('trs','Trust Registration Service')+'.</div></div><div class="fg"><label class="label" for="m-trsdate">Date you last updated the TRS (if known)</label><input class="input" type="date" id="m-trsdate" value="'+esc(d.trsLastUpdated||"")+'"></div></div>';
     var ntSel=d.hmrcNotice||'unsure';
     h+='<div class="fg"><label class="label" for="m-notice">Does HMRC send the trust a tax return (form SA900) to fill in each year?</label><select class="sel" id="m-notice">'+[['yes','Yes'],['no','No'],['unsure','Not sure']].map(function(o){return'<option value="'+o[0]+'"'+(ntSel===o[0]?' selected':'')+'>'+o[1]+'</option>'}).join('')+'</select><div class="hint">This is a '+term('notice','notice to file')+': a letter from HMRC each April, or a reminder if you file online. If HMRC has sent one, you must file even if there is no tax to pay.</div></div>';
-    h+='<details id="m-more"'+(d.id&&d.detailsSeen?'':(d.id?' open':''))+' style="border:1px solid #e5e1dc;border-radius:10px;padding:10px 14px;margin-bottom:14px"><summary style="cursor:pointer;font-size:13px;font-weight:700">More details for the tax figures'+(d.detailsSeen?'':' <span style="font-weight:400;color:#92400e">(not filled in yet)</span>')+'</summary><div class="hint" style="margin:6px 0 12px">About the settlor and inheritance tax. You can skip these for now, but fill them in before relying on the tax figures.</div>';
+    h+='<details id="m-more"'+(d.id&&(!d.detailsSeen||(calcTaxPool(d)&&!openingFigures(d).poolEntered))?' open':'')+' style="border:1px solid #e5e1dc;border-radius:10px;padding:10px 14px;margin-bottom:14px"><summary style="cursor:pointer;font-size:13px;font-weight:700">More details for the tax figures'+(d.detailsSeen?'':' <span style="font-weight:400;color:#92400e">(not filled in yet)</span>')+'</summary><div class="hint" style="margin:6px 0 12px">About the settlor and inheritance tax. You can skip these for now, but fill them in before relying on the tax figures.</div>';
     h+='<div class="info"><div class="info-t">About the settlor (the person who set up the trust)</div><div class="info-b">These answers affect the tax estimates. If you don\'t know them, ask the settlor or the solicitor who set up the trust.</div></div>';
     h+='<div class="g2"><div class="fg"><label class="label" for="m-clts">Gifts into other trusts by the settlor in the 7 years before this one (\u00A3)</label><input class="input" type="number" id="m-clts" aria-label="Settlor prior chargeable lifetime transfers in pounds" value="'+esc(d.settlorPriorCLTs||"0")+'"><div class="hint">Enter 0 if none. Professionals call these "chargeable lifetime transfers". Gifts made straight to people don\'t count.</div></div><div class="fg"><label class="label" for="m-strust">Settlor\'s trusts since 7 June 1978 (incl. this one)</label><input class="input" type="number" min="1" id="m-strust" aria-label="Total number of trusts created by settlor" value="'+esc(d.settlorTrusts||"1")+'"><div class="hint">For capital gains tax: the \u00A31,500 allowance is shared between them. Enter 1 if this is the only one.</div></div></div>';
-    h+='<div class="fg"><label class="label" for="m-otherdisc">Other discretionary trusts made by the same settlor</label><input class="input" type="number" min="0" id="m-otherdisc" style="max-width:160px" value="'+esc(d.otherDiscTrusts!==undefined&&d.otherDiscTrusts!==''?d.otherDiscTrusts:'')+'" placeholder="0"><div style="font-size:11px;color:#64748b;margin-top:5px;line-height:1.5">For income tax only. Enter 0 if none. Count only discretionary trusts that have taxable income, and leave out any where the settlor can benefit. Used to share the \u00A3500 tax-free amount for income tax. Not relevant to interest in possession trusts.</div></div>';
+    h+='<div class="fg"><label class="label" for="m-otherdisc">Other discretionary trusts made by the same settlor</label><input class="input" type="number" min="0" id="m-otherdisc" style="max-width:160px" value="'+esc(d.otherDiscTrusts!==undefined&&d.otherDiscTrusts!==''?d.otherDiscTrusts:'')+'" placeholder="0"><div style="font-size:11px;color:#64748b;margin-top:5px;line-height:1.5">For income tax only. Enter 0 if none. Count the settlor\'s other trusts that had income taxed at the trust rates in the tax year (before any expenses). Leave out trusts the settlor can benefit from, trusts for a disabled person or bereaved minor, heritage maintenance funds and pension trusts. If more than one person set up this trust, use the one who has made the most trusts. Used to share the \u00A3500 tax-free amount. Not relevant to interest in possession trusts.</div></div>';
+    h+='<div class="g2"><div class="fg"><label class="label" for="m-pool0">Tax pool at 5 April 2024 (\u00A3)</label><input class="input" type="number" step="0.01" min="0" id="m-pool0" value="'+esc(d.openingPool!==undefined&&d.openingPool!==null?d.openingPool:'')+'"><div class="hint">Only for discretionary trusts set up before 6 April 2024. Take it from box 14.15 of the trust\'s 2024-25 tax return (SA900), or ask your accountant. Trust Manager works out tax from 2024/25 and counts forward from this figure.</div></div>'
+      +'<div class="fg"><label class="label" for="m-tme0">Unused trust expenses at 5 April 2024 (\u00A3)</label><input class="input" type="number" step="0.01" min="0" id="m-tme0" value="'+esc(d.openingTME!==undefined&&d.openingTME!==null?d.openingTME:'')+'"><div class="hint">Usually 0. Expenses paid from income that hadn\'t yet been set against income. Your accountant can tell you.</div></div></div>';
     h+='<div class="fg"><label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-size:13px;line-height:1.5"><input type="checkbox" id="m-settint"'+(d.settlorInterested?" checked":"")+' aria-label="Settlor-interested trust" style="width:16px;height:16px;margin-top:2px;flex-shrink:0"> <span>Settlor-interested trust<br><span style="font-size:11px;color:#64748b">Tick if the settlor, or their spouse or civil partner, can benefit. Income will then be taxed on the settlor, not the trust. (A trust for the settlor\'s own children under 18 is different: mark those beneficiaries in their details.)</span></span></label></div>';
     var rpOpts=[['auto','Work it out from the trust type'],['yes','Yes'],['no-pre2006','No: the right to income started before 22 March 2006'],['no-ipdi','No: a will gave someone the right to the income straight away'],['unsure','Not sure']];
     h+='<div class="fg"><label class="label" for="m-rp">Is this trust subject to the 10-year inheritance tax charge?</label><select class="sel" id="m-rp">'+rpOpts.map(function(o){return'<option value="'+o[0]+'"'+((d.rpStatus||'auto')===o[0]?' selected':'')+'>'+esc(o[1])+'</option>'}).join('')+'</select><div style="font-size:11px;color:#64748b;margin-top:5px;line-height:1.5">Discretionary trusts usually are; bare and charitable trusts never are. Where someone has the right to the income, it depends on when and how the trust was created. If unsure, choose "Not sure" and check with your solicitor.</div></div>';
@@ -2184,7 +2223,7 @@ function modalBody(){
     h+='<div class="fg"><label class="label" for="m-ben">Beneficiary</label><select class="sel" id="m-ben" aria-label="Select beneficiary"><option value="">Select...</option>'+gbe().map(function(b){return'<option value="'+esc(b.id)+'"'+(b.id===d.beneficiaryId?" selected":"")+'>'+esc(b.name)+'</option>'}).join("")+'</select></div>';
     h+='<div class="g2"><div class="fg"><label class="label" for="m-amt">Amount (\u00A3)</label><input class="input" type="number" step="0.01" id="m-amt" oninput="distPreview()" aria-label="Distribution amount in pounds" value="'+esc(d.amount||"")+'"></div><div class="fg"><label class="label" for="m-dtype">Paid out of</label><select class="sel" id="m-dtype" aria-label="Distribution type" onchange="distPreview()">'+DTP.map(function(v){return'<option value="'+esc(v)+'"'+(v===dSel?' selected':'')+'>'+esc(distLabel(v))+'</option>'}).join('')+'</select></div></div>';
     h+='<div class="hint" style="margin:-6px 0 14px">'+esc(distTypeHint(t)).replace(/^Income means/,term('income','Income')+' means').replace('Capital means',term('capital','Capital')+' means').replace('Capital is money',term('capital','Capital')+' is money')+'</div>';
-    h+='<div class="g3"><div class="fg"><label class="label" for="m-date">Date</label><input class="input" type="date" id="m-date" onchange="distPreview()" aria-label="Distribution date" value="'+esc(d.date||tdy())+'"></div><div class="fg"><label class="label" for="m-meth">Method</label><select class="sel" id="m-meth" aria-label="Payment method">'+opts(ME,d.method||"Bank Transfer")+'</select></div><div class="fg"><label class="label" for="m-appr">Approved By</label><input class="input" id="m-appr" aria-label="Approved by" value="'+esc(d.approvedBy||"")+'"></div></div>';
+    h+='<div class="g3"><div class="fg"><label class="label" for="m-date">Date</label><input class="input" type="date" id="m-date" onchange="distPreview()" aria-label="Distribution date" value="'+esc(d.date||tdy())+'"><div class="hint">The date the money became theirs. Usually the day you paid it, but if the trustees decided earlier (for example in a written resolution), use that date.</div></div><div class="fg"><label class="label" for="m-meth">Method</label><select class="sel" id="m-meth" aria-label="Payment method">'+opts(ME,d.method||"Bank Transfer")+'</select></div><div class="fg"><label class="label" for="m-appr">Approved By</label><input class="input" id="m-appr" aria-label="Approved by" value="'+esc(d.approvedBy||"")+'"></div></div>';
     h+='<div class="fg"><label class="label" for="m-rsn">Reason</label><input class="input" id="m-rsn" aria-label="Reason for distribution" value="'+esc(d.reason||"")+'"></div>';
     h+='<div class="fg" id="m-ihtpay-wrap"'+(dSel==='Capital'?'':' style="display:none"')+'><label class="label" for="m-ihtpay">Who pays any inheritance tax on this capital payment?</label><select class="sel" id="m-ihtpay" onchange="distPreview()"><option value="beneficiary"'+(d.ihtPaidBy!=="trust"?" selected":"")+'>Taken out of the payment</option><option value="trust"'+(d.ihtPaidBy==="trust"?" selected":"")+'>The trust pays it on top</option></select></div>';
     h+=distPreviewHTML(t,{amount:d.amount,distType:dSel,date:d.date||tdy(),ihtPaidBy:d.ihtPaidBy},d.id);
@@ -2206,6 +2245,7 @@ function modalBody(){
     h+='<div class="g3"><div class="fg"><label class="label" for="m-amt">Amount (\u00A3)</label><input class="input" type="number" step="0.01" id="m-amt" aria-label="Income amount in pounds" value="'+esc(d.amount||"")+'"></div><div class="fg"><label class="label" for="m-date">Date received</label><input class="input" type="date" id="m-date" aria-label="Income date" value="'+esc(d.date||tdy())+'"></div><div class="fg"><label class="label" for="m-type">Type</label><select class="sel" id="m-type" aria-label="Income type" onchange="incTypeChange(this.value)">'+ITP.map(function(v){return'<option value="'+esc(v)+'"'+(v===itSel?' selected':'')+'>'+esc(incLabel(v))+'</option>'}).join('')+'</select></div></div>';
     h+='<div id="m-type-hint" class="hint" style="margin:-6px 0 14px">'+esc(incHint(itSel))+'</div>';
     h+='<div class="fg"><label class="label" for="m-src">Where it came from</label><input class="input" id="m-src" aria-label="Income source" placeholder="e.g. Nationwide savings account" value="'+esc(d.source||"")+'"></div>';
+    if(t&&isIIPType(t.type||''))h+='<div class="fg"><label style="display:flex;gap:8px;align-items:flex-start;font-size:13px;cursor:pointer"><input type="checkbox" id="m-mandated"'+(d.mandated?' checked':'')+' style="width:16px;height:16px;margin-top:2px"> Paid straight to the beneficiary, not to the trust</label><div class="hint">Tick if the bank or company pays this income directly to the person entitled to it (a "mandate"). It stays on record, but it isn\'t the trustees\' income, so it isn\'t taxed on them or put on the trust\'s tax return.</div></div>';
     h+='<div style="display:flex;gap:8px;margin-top:16px"><button class="btn btn-primary" onclick="saveInc()">Save</button>'+(d.id?'<button class="btn btn-danger" onclick="delItem(\'income\',\''+ja(d.id)+'\')">Delete</button>':'')+'</div>';
   }
   if(MT==="expense"){
@@ -2336,8 +2376,8 @@ window.showTrustAccount=function(taxYear){
   html+=section('Income paid to beneficiaries',distIncome,function(d){return esc(bna(d.beneficiaryId))+' ('+esc(d.distType)+')'},'Total income paid out',true);
   html+='<div style="'+Ssec+'"><div style="'+Stitle+'">Income summary</div>'
     +'<div style="'+Stotal+'"><span>Income surplus / (deficit) for year</span><span style="font-family:monospace;color:'+(surplusDeficit>=0?'#059669':'#dc2626')+'">&pound;'+surplusDeficit.toFixed(2)+'</span></div>'
-    +txRow(null,'Income tax for the year (estimate)',itax.tax,false)
-    +txRow(null,'Income left after estimated tax',surplusDeficit-itax.tax,true)
+    +(itax.beforeRules?'<div style="padding:8px 10px;font-size:11px;color:#666">Income tax: not calculated. Trust Manager works out tax from '+shortYear(TAX_FROM)+'; see the trust\'s tax return for this year.</div>'
+      :txRow(null,'Income tax for the year (estimate)',itax.tax,false)+txRow(null,'Income left after estimated tax',surplusDeficit-itax.tax,true))
     +'<div style="padding:8px 10px;font-size:10px;color:#666;line-height:1.6">'+(itax.underDeMinimis&&itax.income>0?'Total income is within the de minimis of &pound;'+itax.limit.toFixed(2)+', so no income tax is due. ':'')+'The income tax figure is an estimate for your accountant to confirm on the SA900.</div></div>';
   html+='<div style="font-size:12px;font-weight:700;margin:14px 0 8px">Capital account</div>';
   html+=section('Capital receipts (for example, sale proceeds)',capReceipts,function(i){return esc(i.source||'Sale proceeds')},'Total capital receipts',false);
@@ -2430,6 +2470,7 @@ window.showR185=function(benId,taxYear){
   var t=gt();var b=S.beneficiaries.find(function(v){return v.id===benId});
   if(!t||!b)return;
   taxYear=taxYear||((r185Years(benId)[0]||{}).y)||taxYearOf(tdy());
+  if(beforeTaxFrom(taxYear)){alert('Trust Manager prepares R185s from the '+shortYear(TAX_FROM)+' tax year. For earlier years, use the R185s issued at the time.');return;}
   var yearStart=new Date(taxYear+'-04-06');
   var yearEnd=new Date((taxYear+1)+'-04-06');
 
@@ -2533,9 +2574,9 @@ window.showR185=function(benId,taxYear){
 // SA900 TRUST AND ESTATE TAX RETURN 2026 (tax year 2025-26), HMRC 12/25
 // ============================================================
 function poolBalanceAfter(t,y){
-  var all=trustTaxYears(t),inn=0,out=0,cr=distTaxById(t);
+  var all=trustTaxYears(t),inn=openingFigures(t).pool,out=0,cr=distTaxById(t);
   Object.keys(all).forEach(function(k){if(Number(k)<=y)inn+=all[k].poolTax;});
-  S.distributions.forEach(function(d){if(d.trustId===t.id&&d.date&&taxYearOf(d.date)<=y)out+=(cr[d.id]&&cr[d.id].taxCredit)||0;});
+  S.distributions.forEach(function(d){if(d.trustId===t.id&&d.date&&taxYearOf(d.date)<=y&&!beforeTaxFrom(taxYearOf(d.date)))out+=(cr[d.id]&&cr[d.id].taxCredit)||0;});
   return inn-out;
 }
 function creditsInYear(t,y){var cr=distTaxById(t),s=0;S.distributions.forEach(function(d){if(d.trustId===t.id&&d.date&&taxYearOf(d.date)===y)s+=(cr[d.id]&&cr[d.id].taxCredit)||0;});return s;}
@@ -2558,7 +2599,7 @@ window.showSA900=function(ty){
   var iip=isIIPType(tt),si=!!t.settlorInterested,special=!iip;
   var Y=shortYear(ty).replace('/','\u2013'),YE='5 April '+(ty+1);
   function inYear(x){return x.trustId===t.id&&x.date&&taxYearOf(x.date)===ty;}
-  var inc=S.income.filter(inYear);
+  var inc=S.income.filter(function(i){return inYear(i)&&!(i.mandated&&iip);});
   function sum(f){return inc.filter(f).reduce(function(s,i){return s+(Number(i.amount)||0)},0);}
   var interest=sum(function(i){return i.type==='Interest'}),divs=sum(function(i){return i.type==='Dividends'}),
       rent=sum(function(i){return i.type==='Rental Income'}),other=sum(function(i){return i.type==='Other'||i.type==='Insurance'});

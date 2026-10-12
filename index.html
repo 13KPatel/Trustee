@@ -520,13 +520,15 @@ function computeTaxYear(trust,ty,carryIn){
   var inc=trustYearIncome(trust,ty),tType=trust.type||'Discretionary',RT=taxRates(ty);
   var r={taxYear:ty,income:inc.total,divIncome:inc.div,otherIncome:inc.other,mandated:inc.mandated,limit:DE_MINIMIS,underDeMinimis:inc.total<=DE_MINIMIS,
     otherRate:0,divRate:0,otherTax:0,divTax:0,tax:0,poolTax:0,highTax:0,lowTax:0,taxWithoutTme:0,applies:true,beforeRules:false,rates:RT,
-    tmeIncurred:0,tmeCarriedIn:carryIn||0,tmeUsed:0,tmeCarriedOut:carryIn||0,tmeGrossed:0,trustRateIncome:0};
+    tmeIncurred:0,tmeCarriedIn:carryIn||0,tmeUsed:0,tmeCarriedOut:carryIn||0,tmeGrossed:0,trustRateIncome:0,
+    trace:{income:{div:inc.div,sav:inc.sav,prop:inc.prop,oth:inc.oth,total:inc.total,mandated:inc.mandated},steps:[]}};  // trace: the working, for checking (Tax Centre and the review workbook)
   if(tType==='Bare'||tType==='Charitable'){r.applies=false;return r;}
   if(beforeTaxFrom(ty)){r.beforeRules=true;r.underDeMinimis=false;r.tmeCarriedIn=0;r.tmeCarriedOut=0;return r;}
   if(isIIPType(tType)){
     r.otherRate=RT.basicOther;r.divRate=RT.divOrd;r.tmeCarriedOut=0;
     if(r.underDeMinimis)return r;
     r.otherTax=inc.sav*RT.basicSav+inc.prop*RT.basicProp+inc.oth*RT.basicOther;r.divTax=inc.div*RT.divOrd;
+    [['div',inc.div,RT.divOrd],['sav',inc.sav,RT.basicSav],['prop',inc.prop,RT.basicProp],['oth',inc.oth,RT.basicOther]].forEach(function(x){r.trace.steps.push({type:x[0],income:x[1],rate:x[2],tax:x[1]*x[2]});});
     r.tax=r.otherTax+r.divTax;r.lowTax=r.tax;r.taxWithoutTme=r.tax;
     return r;
   }
@@ -534,11 +536,13 @@ function computeTaxYear(trust,ty,carryIn){
   r.tmeIncurred=tmeIncurred(trust,ty);
   r.limit=deMinimisLimit(trust,inc.total>0.005);
   r.underDeMinimis=inc.total<=r.limit;
+  r.trace.limit={others:otherQualifyingTrusts(trust),limit:r.limit,under:r.underDeMinimis};
   if(r.underDeMinimis){r.tmeCarriedOut=r.tmeIncurred+r.tmeCarriedIn;return r;}
   var left=r.tmeIncurred+r.tmeCarriedIn;
-  var buckets=[{amt:inc.div,low:RT.divOrd,high:RT.trustDiv,div:true},{amt:inc.sav,low:RT.basicSav,high:RT.trustSav},{amt:inc.prop,low:RT.basicProp,high:RT.trustProp},{amt:inc.oth,low:RT.basicOther,high:RT.trustOther}];
+  var buckets=[{amt:inc.div,low:RT.divOrd,high:RT.trustDiv,div:true,type:'div'},{amt:inc.sav,low:RT.basicSav,high:RT.trustSav,type:'sav'},{amt:inc.prop,low:RT.basicProp,high:RT.trustProp,type:'prop'},{amt:inc.oth,low:RT.basicOther,high:RT.trustOther,type:'oth'}];
   buckets.forEach(function(bk){
-    var cap=bk.amt*(1-bk.low),use=Math.min(left,cap);
+    bk.left=left;
+    var cap=bk.amt*(1-bk.low),use=Math.min(left,cap);bk.cap=cap;bk.use=use;
     bk.g=use>=cap-1e-9?bk.amt:use/(1-bk.low);
     left-=use;r.tmeGrossed+=bk.g;
   });
@@ -546,6 +550,7 @@ function computeTaxYear(trust,ty,carryIn){
   r.trustRateIncome=Math.max(0,inc.total-r.tmeGrossed);
   buckets.forEach(function(bk){
     var lo=bk.g*bk.low,hi=(bk.amt-bk.g)*bk.high;
+    r.trace.steps.push({type:bk.type,income:bk.amt,low:bk.low,high:bk.high,cap:bk.cap,left:bk.left,used:bk.use,covered:bk.g,lowTax:lo,highTax:hi});
     r.lowTax+=lo;r.highTax+=hi;
     if(bk.div)r.divTax+=lo+hi;else r.otherTax+=lo+hi;
   });
